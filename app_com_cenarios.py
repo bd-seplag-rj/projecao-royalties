@@ -7,14 +7,11 @@ App Streamlit com duas abas:
 
   1) 🛢️ Petróleo e Gás — projeção de Royalties + Participação Especial do RJ
      a partir da previsão de produção da ANP, da curva a termo do Brent
-     (Yahoo/TradingView) e do Henry Hub para o gás. Cenários "Baixa" e "Alta"
-     em torno da curva a termo (cenário Base), dimensionados pela volatilidade
-     implícita (OVX).
+     (Yahoo/TradingView) e do Henry Hub para o gás.
 
   2) 🏦 Fundo Soberano — projeção da capitalização do fundo estadual, com o
      patrimônio aplicado em títulos públicos de curto/médio prazo (≤ 4 anos)
-     remunerados pela Selic, saque de parte dos rendimentos e projeção nos três
-     cenários de receita (Baixa/Base/Alta).
+     remunerados pela Selic, e saque de parte dos rendimentos.
 
 Fontes de dados no diretório:
   * previsao-producao.csv  ........ Previsão de produção da ANP (m³/ano por bacia)
@@ -51,16 +48,14 @@ COTA_RJ_PE_DEFAULT = 0.40
 
 PATRIMONIO_FUNDO_DEFAULT = 2.045   # R$ bilhões
 
-# Cenários de preço — Base = curva a termo; bandas por volatilidade implícita
-CENARIO_CORES = {"Baixa": "#d62728", "Base": "#1f77b4", "Alta": "#2ca02c"}
+# Cenários de preço (dimensionados por volatilidade implícita)
+CENARIO_CORES = {"Baixo": "#d62728", "Base": "#1f77b4", "Alto": "#2ca02c"}
 CONF_NIVEIS = {                       # rótulo -> quantil superior (z = inv_cdf)
     "P10–P90 (80% de confiança)": 0.90,
     "P05–P95 (90% de confiança)": 0.95,
     "P25–P75 (50% de confiança)": 0.75,
 }
-DEFAULT_IMPLIED_VOL = 0.35            # fallback se o OVX não estiver disponível
-# Fração fixa da receita do RJ (Royalties + PE) aportada ao fundo por cenário
-PCT_APORTE_FUNDO = 0.10
+FAN_QUANTIS = [0.10, 0.25, 0.50, 0.75, 0.90]   # bandas do fan chart
 
 PROD_CSV = "previsao-producao.csv"
 HIST_CSV = "serie_historica_receitas_2015-2026.csv"
@@ -120,7 +115,7 @@ def _close_series(d):
 
 @st.cache_data(show_spinner=True, ttl=60 * 60)
 def baixar_front_e_cambio(lookback_meses: int = 24):
-    """BZ=F (Brent front) e NG=F (Henry Hub) — médias mensais."""
+    """BZ=F (Brent front), USDBRL=X e NG=F (Henry Hub) — médias mensais."""
     try:
         import yfinance as yf
     except Exception as e:
@@ -129,7 +124,7 @@ def baixar_front_e_cambio(lookback_meses: int = 24):
         fim = dt.date.today()
         ini = fim - dt.timedelta(days=int(lookback_meses * 31) + 5)
         out = {}
-        for tk, nome in [("BZ=F", "brent_usd"), ("NG=F", "hh_usd")]:
+        for tk, nome in [("BZ=F", "brent_usd"), ("USDBRL=X", "usdbrl"), ("NG=F", "hh_usd")]:
             d = yf.download(tk, start=ini.isoformat(), end=fim.isoformat(),
                             interval="1d", progress=False, auto_adjust=False)
             if d is not None and not d.empty:
@@ -137,39 +132,13 @@ def baixar_front_e_cambio(lookback_meses: int = 24):
         if "brent_usd" not in out:
             return None, "Sem dados de Brent (BZ=F) no Yahoo Finance."
         m = pd.DataFrame(out)
-        if "hh_usd" in m:
-            m["hh_usd"] = m["hh_usd"].ffill().bfill()
+        for c in ("usdbrl", "hh_usd"):
+            if c in m:
+                m[c] = m[c].ffill().bfill()
         m.index = m.index.to_period("M").to_timestamp()
         return m.dropna(subset=["brent_usd"]), None
     except Exception as e:
         return None, f"Falha no Yahoo Finance: {e}"
-
-
-@st.cache_data(show_spinner=True, ttl=60 * 60 * 6)
-def baixar_cambio_ovx_diario(dia: str):
-    """
-    Câmbio USD/BRL (USDBRL=X) e volatilidade implícita OVX (^OVX) na cotação
-    diária mais recente. O argumento 'dia' (data ISO de hoje) entra na chave de
-    cache para forçar a atualização a cada novo dia.
-    """
-    info = {"usdbrl": None, "usdbrl_data": None, "ovx": None, "ovx_data": None, "err": None}
-    try:
-        import yfinance as yf
-    except Exception as e:
-        info["err"] = f"yfinance indisponível: {e}"
-        return info
-    try:
-        for tk, ck in [("USDBRL=X", "usdbrl"), ("^OVX", "ovx")]:
-            d = yf.download(tk, period="10d", interval="1d",
-                            progress=False, auto_adjust=False)
-            if d is not None and not d.empty:
-                serie = _close_series(d).dropna()
-                if len(serie):
-                    info[ck] = float(serie.iloc[-1])
-                    info[ck + "_data"] = serie.index[-1].date().isoformat()
-    except Exception as e:
-        info["err"] = str(e)
-    return info
 
 
 @st.cache_data(show_spinner=True, ttl=60 * 60)
@@ -266,6 +235,47 @@ def preco_usd_anual(anos, stat, curva_df, front_usd_stat):
     return pd.Series(out, name="preco_usd"), origem
 
 
+@st.cache_data(show_spinner=True, ttl=60 * 60)
+def baixar_volatilidades(lookback_meses: int = 24):
+    """
+    Volatilidade para dimensionar as bandas de cenário:
+      - petróleo: volatilidade IMPLÍCITA via índice OVX da CBOE (^OVX);
+      - gás: volatilidade histórica anualizada de NG=F (não há índice de vol.
+        implícita de gás natural com série pública livre);
+      - petróleo (histórica, BZ=F): fallback caso o OVX não retorne.
+    """
+    info = {"oil_iv": None, "oil_hist": None, "gas_hist": None,
+            "fonte_oleo": None, "fonte_gas": None, "err": None}
+    try:
+        import yfinance as yf
+    except Exception as e:
+        info["err"] = f"yfinance indisponível: {e}"
+        return info
+    try:
+        fim = dt.date.today()
+        ini = fim - dt.timedelta(days=int(lookback_meses * 31) + 5)
+
+        def hist_vol(tk):
+            d = yf.download(tk, start=ini.isoformat(), end=fim.isoformat(),
+                            interval="1d", progress=False, auto_adjust=False)
+            if d is None or d.empty:
+                return None
+            r = np.log(_close_series(d).dropna()).diff().dropna()
+            return float(r.std() * np.sqrt(252)) if len(r) > 5 else None
+
+        ov = yf.download("^OVX", start=ini.isoformat(), end=fim.isoformat(),
+                         interval="1d", progress=False, auto_adjust=False)
+        if ov is not None and not ov.empty:
+            info["oil_iv"] = float(_close_series(ov).dropna().iloc[-1]) / 100.0
+            info["fonte_oleo"] = "OVX — vol. implícita (CBOE)"
+        info["oil_hist"] = hist_vol("BZ=F")
+        info["gas_hist"] = hist_vol("NG=F")
+        info["fonte_gas"] = "NG=F — vol. histórica"
+    except Exception as e:
+        info["err"] = str(e)
+    return info
+
+
 def _horizonte_anos(ano):
     """Horizonte (em anos) de hoje até o ano; 0 para anos já decorridos."""
     h = ano - dt.date.today().year
@@ -275,7 +285,7 @@ def _horizonte_anos(ano):
 def fatores_quantil(anos, vol, z):
     """
     Fator multiplicativo lognormal por ano: exp(z·σ·√t).
-    z=0 → cenário base (fator 1). Bandas crescem com √(horizonte).
+    z=0 → curva base (fator 1). Bandas crescem com √(horizonte).
     """
     if vol is None or vol <= 0:
         return pd.Series({a: 1.0 for a in anos})
@@ -331,7 +341,7 @@ def projetar_fundo(patrimonio0, taxas_anuais, pct_saque, aportes=None):
       rendimento_bruto = patrimônio_início × Selic
       saque            = rendimento_bruto × pct_saque   (revertido a outros fins)
       reinvestido      = rendimento_bruto − saque
-      aporte           = receita de petróleo/gás destinada ao fundo (por cenário)
+      aporte           = receita de petróleo/gás destinada ao fundo (opcional)
       patrimônio_fim   = patrimônio_início + reinvestido + aporte
 
     'indice_selic' é o rendimento acumulado (base 100) usando apenas a Selic —
@@ -373,10 +383,10 @@ def render_petroleo(df_prod, params):
     bacias, ambiente, fator_rj, anos_sel = p["bacias"], p["ambiente"], p["fator_rj"], p["anos_sel"]
     if not bacias:
         st.warning("Selecione ao menos uma bacia na barra lateral para ver a projeção de petróleo e gás.")
-        return None
+        return
     if not anos_sel:
         st.warning("Selecione ao menos um ano na barra lateral.")
-        return None
+        return
 
     stat, modo_preco = p["stat"], p["modo_preco"]
     anos = sorted(anos_sel)
@@ -392,12 +402,11 @@ def render_petroleo(df_prod, params):
         else:
             erro_curva = (erro_curva or "") + f" | {erro_tv}"
 
-    fx_ovx = baixar_cambio_ovx_diario(dt.date.today().isoformat())
-    if p["cambio_modo"] == "Manual" or fx_ovx["usdbrl"] is None:
-        usdbrl, usdbrl_data = p["cambio_manual"], "definido manualmente"
+    if p["cambio_modo"] == "Manual" or front_df is None or \
+            "usdbrl" not in (front_df.columns if front_df is not None else []):
+        usdbrl = p["cambio_manual"]
     else:
-        usdbrl, usdbrl_data = fx_ovx["usdbrl"], fx_ovx["usdbrl_data"]
-    ovx, ovx_data = fx_ovx["ovx"], fx_ovx["ovx_data"]
+        usdbrl = float(front_df["usdbrl"].dropna().iloc[-1])
 
     if front_df is not None and not front_df.empty:
         s = front_df["brent_usd"].dropna()
@@ -420,25 +429,33 @@ def render_petroleo(df_prod, params):
         {a: gas_base_brl_m3 * (1 + p["reajuste_gas"]) ** (a - ano_base) for a in anos},
         name="preco_gas_brl")
 
-    # ----- Volatilidade implícita e amplitude dos cenários ----------------- #
-    vol_impl = (ovx / 100.0) if ovx is not None else DEFAULT_IMPLIED_VOL
-    fonte_vol = f"OVX ({ovx_data})" if ovx is not None else f"padrão {DEFAULT_IMPLIED_VOL:.0%}"
+    # ----- Volatilidade para os cenários ----------------------------------- #
+    vol_info = baixar_volatilidades(p["lookback"])
+    if p["vol_manual_on"]:
+        oil_vol, gas_vol = p["vol_oleo_manual"], p["vol_gas_manual"]
+        fonte_oleo = fonte_gas = "volatilidade manual"
+    else:
+        oil_vol = vol_info["oil_iv"] or vol_info["oil_hist"]
+        gas_vol = vol_info["gas_hist"]
+        fonte_oleo = vol_info["fonte_oleo"] or (
+            "BZ=F — vol. histórica" if vol_info["oil_hist"] else "indisponível")
+        fonte_gas = vol_info["fonte_gas"] or "indisponível"
     z = NormalDist().inv_cdf(CONF_NIVEIS[p["conf_nivel"]])
 
     # ----- Painel de preços ------------------------------------------------ #
     st.subheader("💵 Preço de referência — curva a termo do Brent")
     c1, c2 = st.columns([2, 1])
     with c2:
-        st.metric("Câmbio USD/BRL (diário)", f"R$ {usdbrl:,.4f}")
-        st.caption(f"Cotação de {usdbrl_data}")
-        if ovx is not None:
-            st.metric("OVX — vol. implícita (diário)", f"{ovx:,.1f}%")
-            st.caption(f"OVX de {ovx_data}")
+        st.metric("Câmbio USD/BRL", f"R$ {usdbrl:,.2f}")
+        if oil_vol:
+            st.metric("Vol. do óleo (bandas)", f"{oil_vol*100:,.1f}% a.a.")
         if p["gas_modo"].startswith("Henry Hub") and p["incluir_gas"]:
             st.metric("Gás (Henry Hub → R$/m³)", f"R$ {gas_base_brl_m3:,.3f}/m³")
         if erro_curva:
             st.warning(f"Curva a termo: {erro_curva.strip(' |')}")
         st.caption(f"Fonte da curva: **{fonte_curva}**")
+        st.caption(f"Vol. óleo: {fonte_oleo}"
+                   + (f" · gás: {fonte_gas} ({gas_vol*100:,.0f}%)" if p["incluir_gas"] and gas_vol else ""))
     with c1:
         tab = pd.DataFrame({
             "Preço óleo (US$/bbl)": preco_usd.round(2),
@@ -451,21 +468,44 @@ def render_petroleo(df_prod, params):
 
     if curva_df is not None and not curva_df.empty:
         fig_c = go.Figure()
+        xf = [dt.date(a, 7, 1) for a in anos]
+
+        # Fan chart — bandas de cenário em torno do preço anual (vol. implícita)
+        if oil_vol:
+            def _banda(q):
+                zc = NormalDist().inv_cdf(q)
+                return (preco_usd * fatores_quantil(anos, oil_vol, zc)).values
+            p10, p25, p75, p90 = _banda(0.10), _banda(0.25), _banda(0.75), _banda(0.90)
+            fig_c.add_trace(go.Scatter(x=xf, y=p90, mode="lines", line=dict(width=0),
+                                       hoverinfo="skip", showlegend=False))
+            fig_c.add_trace(go.Scatter(x=xf, y=p10, mode="lines", line=dict(width=0),
+                                       fill="tonexty", fillcolor="rgba(31,119,180,0.12)",
+                                       name="Banda P10–P90", hoverinfo="skip"))
+            fig_c.add_trace(go.Scatter(x=xf, y=p75, mode="lines", line=dict(width=0),
+                                       hoverinfo="skip", showlegend=False))
+            fig_c.add_trace(go.Scatter(x=xf, y=p25, mode="lines", line=dict(width=0),
+                                       fill="tonexty", fillcolor="rgba(31,119,180,0.22)",
+                                       name="Banda P25–P75", hoverinfo="skip"))
+
         cd = curva_df.copy()
         cd["ref"] = pd.to_datetime(dict(year=cd["ano"], month=cd["mes"], day=1))
         cd = cd.sort_values("ref")
         fig_c.add_trace(go.Scatter(x=cd["ref"], y=cd["fwd_usd"], mode="lines+markers",
                                    name="Forward Brent (US$/bbl)"))
         fig_c.add_trace(go.Scatter(
-            x=[dt.date(a, 7, 1) for a in anos], y=preco_usd.values, mode="markers",
+            x=xf, y=preco_usd.values, mode="lines+markers",
             marker=dict(size=12, symbol="diamond", color="firebrick"),
-            name=f"Preço anual base ({stat})"))
-        fig_c.update_layout(title="Curva a termo do Brent e preço anual de referência (Base)",
-                            height=340, yaxis_title="US$/bbl",
-                            margin=dict(l=10, r=10, t=40, b=10))
+            line=dict(color="firebrick"), name=f"Preço anual base ({stat})"))
+        fig_c.update_layout(
+            title="Curva a termo do Brent, preço anual de referência e bandas de cenário",
+            height=360, yaxis_title="US$/bbl", margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
         st.plotly_chart(fig_c, width='stretch')
+        if oil_vol:
+            st.caption(f"Bandas (fan chart) dimensionadas pela volatilidade do óleo "
+                       f"({oil_vol*100:,.1f}% a.a., {fonte_oleo}); largura ∝ √(horizonte).")
 
-    # ----- Volumes --------------------------------------------------------- #
+    # ----- Volumes e valor da produção ------------------------------------- #
     vol_oleo_m3 = volume_por_ano(df_prod, bacias, ambiente, fator_rj, "VOLUME PETRÓLEO")
     vol_oleo_m3 = vol_oleo_m3[vol_oleo_m3.index.isin(anos)]
     vol_oleo_bbl = vol_oleo_m3 * M3_TO_BBL
@@ -474,7 +514,7 @@ def render_petroleo(df_prod, params):
     vol_gas_milm3 = vol_gas_milm3.reindex(anos).fillna(0.0)
     vol_gas_m3 = vol_gas_milm3 * 1000.0
 
-    # ----- Pipeline de receita e cenários ---------------------------------- #
+    # ----- Cenários de preço (base + bandas por volatilidade) -------------- #
     aliquota, cota_5, cota_exc = p["aliquota"], p["cota_5"], p["cota_exc"]
     hist_df, hist_ok = carregar_historico_pe_royalties()
     pe_lin = (p["metodo_pe"] != "Deduções informadas"
@@ -500,11 +540,11 @@ def render_petroleo(df_prod, params):
         return {"valor_oleo": v_oleo, "valor_gas": v_gas, "valor_producao": v_prod,
                 "roy_rj": r_rj, "roy_oleo": r_oleo, "pe_rj": pe, "total": r_rj + pe}
 
-    # Base = curva a termo (z=0); Baixa/Alta escalam óleo e gás pela vol. implícita
     cenarios = {}
-    for nome, zc in [("Baixa", -z), ("Base", 0.0), ("Alta", z)]:
-        fator = fatores_quantil(anos, vol_impl, zc)
-        cenarios[nome] = pipeline(preco_oleo_brl * fator, preco_gas_brl * fator)
+    for nome, zc in [("Baixo", -z), ("Base", 0.0), ("Alto", z)]:
+        po = preco_oleo_brl * fatores_quantil(anos, oil_vol, zc)
+        pg = preco_gas_brl * fatores_quantil(anos, gas_vol, zc)
+        cenarios[nome] = pipeline(po, pg)
 
     base = cenarios["Base"]
     valor_oleo, valor_gas = base["valor_oleo"], base["valor_gas"]
@@ -513,7 +553,7 @@ def render_petroleo(df_prod, params):
     roy_gas = roy_rj - roy_oleo
     pe_rj = base["pe_rj"]
     cenarios_tot = pd.DataFrame(
-        {nome: cenarios[nome]["total"] for nome in ["Baixa", "Base", "Alta"]})
+        {nome: cenarios[nome]["total"] for nome in ["Baixo", "Base", "Alto"]})
 
     if p["metodo_pe"] == "Deduções informadas":
         pe_info = (f"PE por deduções: receita líquida = bruta × (1 − {p['ded_pct']:.0%}); "
@@ -538,8 +578,8 @@ def render_petroleo(df_prod, params):
     res["Total RJ (R$ bi)"] = (res["Royalties RJ (R$ bi)"] + res["Part. Especial RJ (R$ bi)"]).round(2)
 
     tot_base = cenarios_tot["Base"].sum() / 1e9
-    tot_baixa = cenarios_tot["Baixa"].sum() / 1e9
-    tot_alta = cenarios_tot["Alta"].sum() / 1e9
+    tot_baixo = cenarios_tot["Baixo"].sum() / 1e9
+    tot_alto = cenarios_tot["Alto"].sum() / 1e9
 
     st.divider()
     st.subheader("📊 Projeção anual de receitas do RJ (cenário base)")
@@ -548,7 +588,7 @@ def render_petroleo(df_prod, params):
     k2.metric("Royalties (período)", f"R$ {res['Royalties RJ (R$ bi)'].sum():,.1f} bi")
     k3.metric("Part. Especial (período)", f"R$ {res['Part. Especial RJ (R$ bi)'].sum():,.1f} bi")
     k4.metric("Total RJ base (período)", f"R$ {tot_base:,.1f} bi",
-              delta=f"Baixa {tot_baixa:,.1f} · Alta {tot_alta:,.1f}", delta_color="off")
+              delta=f"Baixo {tot_baixo:,.1f} · Alto {tot_alto:,.1f}", delta_color="off")
 
     if p["incluir_gas"]:
         st.caption(f"Do total de royalties, gás responde por ~R$ {(roy_gas.sum()/1e9):,.1f} bi "
@@ -564,14 +604,14 @@ def render_petroleo(df_prod, params):
     st.plotly_chart(fig, width='stretch')
     st.dataframe(res.set_index("Ano"), width='stretch')
 
-    # ----- Comparação de cenários (sem fan chart) -------------------------- #
+    # ----- Comparação de cenários ------------------------------------------ #
     st.divider()
     st.subheader("🎚️ Cenários de preço — Total RJ (Royalties + PE)")
-    st.caption(f"Base = curva a termo. Cenários **Baixa** e **Alta** no nível "
-               f"**{p['conf_nivel']}**, dimensionados pela **volatilidade implícita** "
-               f"({vol_impl*100:,.1f}% a.a., {fonte_vol}). Os cenários afetam óleo e gás.")
+    st.caption(f"Base = curva a termo. Bandas Alto/Baixo no nível **{p['conf_nivel']}**, "
+               "dimensionadas pela volatilidade implícita do óleo (OVX) e histórica do gás. "
+               "Os cenários afetam **óleo e gás**.")
     fig_s = go.Figure()
-    for nome in ["Baixa", "Base", "Alta"]:
+    for nome in ["Baixo", "Base", "Alto"]:
         fig_s.add_trace(go.Bar(
             x=list(cenarios_tot.index), y=(cenarios_tot[nome] / 1e9).round(2),
             name=nome, marker_color=CENARIO_CORES[nome]))
@@ -582,8 +622,8 @@ def render_petroleo(df_prod, params):
                                     xanchor="right", x=1))
     st.plotly_chart(fig_s, width='stretch')
 
-    cmp = (cenarios_tot[["Baixa", "Base", "Alta"]] / 1e9).round(2)
-    cmp.columns = ["Baixa (R$ bi)", "Base (R$ bi)", "Alta (R$ bi)"]
+    cmp = (cenarios_tot[["Baixo", "Base", "Alto"]] / 1e9).round(2)
+    cmp.columns = ["Baixo (R$ bi)", "Base (R$ bi)", "Alto (R$ bi)"]
     cmp.index = [str(a) for a in cmp.index]     # índice homogêneo (evita erro Arrow)
     cmp.index.name = "Ano"
     cmp.loc["Período"] = cmp.sum().round(2)
@@ -617,15 +657,14 @@ gás em **mil m³** → m³. Bacias: {', '.join(bacias)} · ambiente {ambiente} 
 
 **Preço do petróleo — curva a termo do Brent:** contratos futuros mensais do Yahoo
 (`BZ{{mês}}{{ano}}.NYM`); cada contrato dá o preço forward do respectivo mês de entrega.
-O preço anual é a **{modo_preco.lower()}** dos preços mensais forward do ano. Câmbio USD/BRL
-diário ({usdbrl_data}): R$ {usdbrl:,.4f}.
-
-**Cenários:** o **Base** é a curva a termo. **Baixa** e **Alta** aplicam bandas lognormais
-`exp(±z·σ·√t)` sobre óleo e gás, com **σ = volatilidade implícita** ({vol_impl*100:,.1f}% a.a.,
-{fonte_vol}) e z do nível **{p['conf_nivel']}**. A largura cresce com √(horizonte).
+O preço anual é a **{modo_preco.lower()}** dos preços mensais forward do ano. Anos já
+decorridos usam o front-month `BZ=F`; anos além da curva carregam o último forward.
+Fallback quando falta série no Yahoo: **TradingView `BRN1!`** (lib `tvDatafeed`) e entrada manual.
+Fonte utilizada nesta execução: **{fonte_curva}**. Câmbio USD/BRL: R$ {usdbrl:,.2f}.
 
 **Gás natural:** {'incluído' if p['incluir_gas'] else 'excluído'}. Preço via
 {'Henry Hub (NG=F) convertido — 1 m³ ≈ ' + f'{GAS_M3_TO_MMBTU} MMBtu' if p['gas_modo'].startswith('Henry') else 'entrada manual em R$/m³'}.
+O valor da produção de gás soma-se ao do óleo antes do cálculo de royalties/PE.
 
 **Royalties (regra vigente — liminar STF 2013):** valor = volume × preço;
 parcela mínima = 5% · excedente = (alíquota − 5%); RJ recebe **{cota_5:.1%}** da mínima
@@ -649,8 +688,8 @@ def render_fundo(cenarios_receita=None):
     st.caption(
         "Premissa: todo o patrimônio está aplicado em títulos públicos de curto a médio "
         "prazo (horizonte máximo de 4 anos), remunerados pela taxa Selic. Parte dos "
-        f"rendimentos é sacada a cada ano; o fundo recebe aporte fixo de "
-        f"**{PCT_APORTE_FUNDO:.0%}** da receita de petróleo/gás do RJ em cada cenário."
+        "rendimentos é sacada a cada ano; opcionalmente, parte das receitas de "
+        "petróleo/gás é aportada ao fundo (por cenário)."
     )
 
     cfg1, cfg2 = st.columns([1, 1])
@@ -676,45 +715,59 @@ def render_fundo(cenarios_receita=None):
             f"Ano {i+1} ({ano0 + i})", value=defaults[i],
             min_value=0.0, max_value=50.0, step=0.25, key=f"selic_{i}") / 100.0)
 
-    # ----- Aportes por cenário (percentual fixo da receita) ---------------- #
+    # ----- Aportes por cenário (receitas de petróleo/gás) ------------------ #
     tem_cenarios = cenarios_receita is not None and not cenarios_receita.empty
+    usar_aportes, pct_aporte = False, 0.0
+    if tem_cenarios:
+        ca1, ca2 = st.columns([1, 1])
+        with ca1:
+            usar_aportes = st.checkbox(
+                "Incorporar aportes das receitas de petróleo/gás (por cenário)", value=True)
+        with ca2:
+            pct_aporte = st.slider(
+                "% da receita do RJ (Royalties + PE) destinada ao fundo",
+                0, 100, 10, disabled=not usar_aportes,
+                help="Aporte anual = % × Total RJ do respectivo cenário (Baixo/Base/Alto).") / 100.0
+    else:
+        st.caption("ℹ️ Selecione bacias/anos na aba **Petróleo e Gás** para incorporar "
+                   "aportes por cenário ao fundo.")
+
     fund_years = [ano0 + i for i in range(len(taxas))]
 
     def aportes_do_cenario(scn):
-        if not (tem_cenarios and scn in cenarios_receita):
+        if not (usar_aportes and tem_cenarios and scn in cenarios_receita):
             return [0.0] * len(taxas)
         serie = cenarios_receita[scn].reindex(fund_years).fillna(0.0)
-        return list(serie.values * PCT_APORTE_FUNDO)
+        return list(serie.values * pct_aporte)
 
     dff_scn = {}
-    for scn in ["Baixa", "Base", "Alta"]:
+    for scn in ["Baixo", "Base", "Alto"]:
         dff_scn[scn], _ = projetar_fundo(patr0_bi * 1e9, taxas, pct_saque, aportes_do_cenario(scn))
     dff = dff_scn["Base"]
-
-    if not tem_cenarios:
-        st.info("ℹ️ Selecione bacias/anos na aba **Petróleo e Gás** para projetar os três "
-                "cenários de receita no fundo. Exibindo apenas a dinâmica base (sem aportes).")
+    mostra_cenarios = usar_aportes and tem_cenarios
 
     # ----- Métricas -------------------------------------------------------- #
     patr_final = dff["patr_fim"].iloc[-1]
     total_saque = dff["saque"].sum()
     total_rend = dff["rendimento_bruto"].sum()
     total_aporte = dff["aporte"].sum()
-    pf_lo = dff_scn["Baixa"]["patr_fim"].iloc[-1] / 1e9
-    pf_hi = dff_scn["Alta"]["patr_fim"].iloc[-1] / 1e9
 
     m1, m2, m3, m4 = st.columns(4)
-    if tem_cenarios:
+    if mostra_cenarios:
+        pf_lo = dff_scn["Baixo"]["patr_fim"].iloc[-1] / 1e9
+        pf_hi = dff_scn["Alto"]["patr_fim"].iloc[-1] / 1e9
         m1.metric("Patrimônio final (base)", f"R$ {patr_final/1e9:,.3f} bi",
-                  delta=f"Baixa {pf_lo:,.2f} · Alta {pf_hi:,.2f}", delta_color="off")
+                  delta=f"Baixo {pf_lo:,.2f} · Alto {pf_hi:,.2f}", delta_color="off")
+    else:
+        m1.metric("Patrimônio final", f"R$ {patr_final/1e9:,.3f} bi",
+                  delta=f"{(patr_final/(patr0_bi*1e9)-1)*100:,.1f}% no período")
+    m2.metric("Rendimento bruto (período)", f"R$ {total_rend/1e9:,.3f} bi")
+    m3.metric("Total sacado (período)", f"R$ {total_saque/1e9:,.3f} bi")
+    if mostra_cenarios:
         m4.metric("Total aportado (base)", f"R$ {total_aporte/1e9:,.3f} bi")
     else:
         cagr = (patr_final / (patr0_bi * 1e9)) ** (1 / len(taxas)) - 1
-        m1.metric("Patrimônio final", f"R$ {patr_final/1e9:,.3f} bi",
-                  delta=f"{(patr_final/(patr0_bi*1e9)-1)*100:,.1f}% no período")
         m4.metric("Crescimento médio do patrimônio", f"{cagr*100:,.2f}% a.a.")
-    m2.metric("Rendimento bruto (período)", f"R$ {total_rend/1e9:,.3f} bi")
-    m3.metric("Total sacado (período)", f"R$ {total_saque/1e9:,.3f} bi")
 
     # ----- Gráfico 1: curva de rendimentos (sinal e inclinação, sem R$) ---- #
     st.markdown("##### 📈 Curva de rendimentos (base Selic) — sinal e inclinação")
@@ -747,42 +800,58 @@ def render_fundo(cenarios_receita=None):
                f"Inclinação da curva Selic: **{tend}** "
                f"(de {taxas[0]*100:,.2f}% para {taxas[-1]*100:,.2f}%).")
 
-    # ----- Gráfico 2: capitalização do fundo por cenário (R$) -------------- #
-    st.markdown("##### 💰 Capitalização do fundo ao longo dos anos (por cenário)")
+    # ----- Gráfico 2: capitalização do fundo (R$) -------------------------- #
+    st.markdown("##### 💰 Capitalização do fundo ao longo dos anos")
     figB = go.Figure()
     # barras (cenário base) no eixo primário
     figB.add_trace(go.Bar(
         x=dff["Ano"], y=(dff["saque"] / 1e9).round(3),
-        name="Saque (revertido)", marker_color="#d62728", opacity=0.6))
+        name="Saque (revertido)", marker_color="#d62728", opacity=0.7))
     figB.add_trace(go.Bar(
         x=dff["Ano"], y=(dff["reinvestido"] / 1e9).round(3),
-        name="Rendimento reinvestido", marker_color="#2ca02c", opacity=0.6))
-    if total_aporte > 0:
+        name="Rendimento reinvestido", marker_color="#2ca02c", opacity=0.7))
+    if mostra_cenarios and total_aporte > 0:
         figB.add_trace(go.Bar(
             x=dff["Ano"], y=(dff["aporte"] / 1e9).round(3),
-            name="Aporte petróleo/gás (base)", marker_color="#9467bd", opacity=0.6))
+            name="Aporte petróleo/gás (base)", marker_color="#9467bd", opacity=0.7))
 
-    # linhas de patrimônio — uma por cenário (sem preenchimento/fan)
+    def _linha_patr(scn):
+        return [round(patr0_bi, 3)] + list((dff_scn[scn]["patr_fim"] / 1e9).round(3))
     x_patr = [ano0 - 1] + list(dff["Ano"])
-    for scn in ["Baixa", "Base", "Alta"]:
-        y_patr = [round(patr0_bi, 3)] + list((dff_scn[scn]["patr_fim"] / 1e9).round(3))
+
+    if mostra_cenarios:
+        # banda Baixo–Alto + linha base (eixo secundário)
         figB.add_trace(go.Scatter(
-            x=x_patr, y=y_patr, mode="lines+markers", yaxis="y2",
-            name=f"Patrimônio — {scn}",
-            line=dict(color=CENARIO_CORES[scn],
-                      width=3 if scn == "Base" else 2,
-                      dash="solid" if scn == "Base" else "dot")))
+            x=x_patr, y=_linha_patr("Alto"), mode="lines", yaxis="y2",
+            line=dict(color=CENARIO_CORES["Alto"], width=1, dash="dot"),
+            name="Patrimônio — Alto"))
+        figB.add_trace(go.Scatter(
+            x=x_patr, y=_linha_patr("Baixo"), mode="lines", yaxis="y2",
+            line=dict(color=CENARIO_CORES["Baixo"], width=1, dash="dot"),
+            fill="tonexty", fillcolor="rgba(31,119,180,0.12)",
+            name="Patrimônio — Baixo"))
+        figB.add_trace(go.Scatter(
+            x=x_patr, y=_linha_patr("Base"), mode="lines+markers", yaxis="y2",
+            line=dict(color=CENARIO_CORES["Base"], width=3),
+            name="Patrimônio — Base"))
+    else:
+        figB.add_trace(go.Scatter(
+            x=x_patr, y=_linha_patr("Base"), mode="lines+markers", yaxis="y2",
+            name="Patrimônio do fundo (R$ bi)", line=dict(color="#1f77b4", width=3)))
 
     figB.update_layout(
-        barmode="stack", height=430,
+        barmode="stack", height=420,
         margin=dict(l=10, r=10, t=30, b=10),
         yaxis=dict(title="Fluxos anuais (R$ bi)", rangemode="tozero"),
         yaxis2=dict(title="Patrimônio do fundo (R$ bi)", color="#1f77b4",
                     overlaying="y", side="right", rangemode="tozero"),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
     st.plotly_chart(figB, width='stretch')
+    if mostra_cenarios:
+        st.caption(f"Aportes = {pct_aporte:.0%} da receita do RJ de cada cenário. "
+                   "A banda mostra o patrimônio entre os cenários Baixo e Alto; a linha, o Base.")
 
-    # ----- Tabelas --------------------------------------------------------- #
+    # ----- Tabela e download ---------------------------------------------- #
     tabela = pd.DataFrame({
         "Ano": dff["Ano"],
         "Selic (%)": (dff["Selic"] * 100).round(2),
@@ -792,15 +861,15 @@ def render_fundo(cenarios_receita=None):
         "Aporte (R$ bi)": (dff["aporte"] / 1e9).round(3),
         "Patrimônio fim (R$ bi)": (dff["patr_fim"] / 1e9).round(3),
     })
-    st.markdown("**Detalhamento — cenário base**")
     st.dataframe(tabela.set_index("Ano"), width='stretch')
 
-    st.markdown("**Patrimônio ao fim do ano por cenário (R$ bi)**")
-    cmp_f = pd.DataFrame(
-        {scn: (dff_scn[scn]["patr_fim"] / 1e9).round(3).values for scn in ["Baixa", "Base", "Alta"]},
-        index=fund_years)
-    cmp_f.index.name = "Ano"
-    st.dataframe(cmp_f, width='stretch')
+    if mostra_cenarios:
+        st.markdown("**Patrimônio ao fim do ano por cenário (R$ bi)**")
+        cmp_f = pd.DataFrame(
+            {scn: (dff_scn[scn]["patr_fim"] / 1e9).round(3).values for scn in ["Baixo", "Base", "Alto"]},
+            index=fund_years)
+        cmp_f.index.name = "Ano"
+        st.dataframe(cmp_f, width='stretch')
 
     csv_buf = io.StringIO()
     tabela.to_csv(csv_buf, index=False, sep=";", decimal=",")
@@ -817,16 +886,16 @@ públicos de curto a médio prazo (horizonte ≤ 4 anos), remunerados pela **Sel
 - Rendimento bruto = patrimônio no início do ano × Selic esperada do ano
 - Saque = rendimento bruto × {pct_saque:.0%} (revertido a outros fins)
 - Reinvestido = rendimento bruto − saque
-- Aporte = **{PCT_APORTE_FUNDO:.0%}** da receita de petróleo/gás do RJ no cenário (fixo)
+- Aporte = {pct_aporte:.0%} da receita de petróleo/gás do cenário {'(ativo)' if mostra_cenarios else '(desativado)'}
 - Patrimônio ao fim = patrimônio no início + reinvestido + aporte
 
 O **primeiro gráfico** não usa valores em R$: apresenta o nível/sinal e a inclinação da
 curva de rendimentos (Selic anual e índice acumulado base 100). O **segundo gráfico**
-mostra a capitalização do fundo nos três cenários (Baixa/Base/Alta), com os fluxos
-anuais do cenário base nas barras.
+mostra a capitalização efetiva do fundo, em R$; quando os aportes por cenário estão ativos,
+a banda cobre os cenários **Baixo–Alto** e a linha central é o **Base**.
 
 *Modelo simplificado: não considera marcação a mercado, tributação ou inflação.
-Os cenários de receita vêm da aba Petróleo e Gás (bandas por volatilidade implícita).*
+Os cenários de preço vêm da aba Petróleo e Gás (bandas por volatilidade implícita).*
 """)
 
 
@@ -866,7 +935,7 @@ with st.sidebar:
     stat = "media" if modo_preco.startswith("Média") else "mediana"
     lookback = st.slider("Janela do front-month BZ=F (meses)", 6, 60, 24)
     usar_tv = st.checkbox("Usar TradingView (BRN1!) como fallback se faltar série no Yahoo", value=True)
-    cambio_modo = st.radio("Câmbio USD→BRL", ["Automático (Yahoo, diário)", "Manual"], horizontal=True)
+    cambio_modo = st.radio("Câmbio USD→BRL", ["Automático (Yahoo)", "Manual"], horizontal=True)
     cambio_manual = st.number_input("USD/BRL manual", value=5.40, min_value=1.0,
                                     max_value=15.0, step=0.05,
                                     disabled=(cambio_modo != "Manual"))
@@ -876,9 +945,16 @@ with st.sidebar:
 
     st.subheader("Cenários de preço")
     conf_nivel = st.selectbox(
-        "Amplitude das bandas (nível de confiança)", list(CONF_NIVEIS.keys()),
-        help="Base = curva a termo. Cenários Baixa/Alta dimensionados pela volatilidade "
-             "implícita (OVX) e pela amplitude escolhida.")
+        "Nível de confiança das bandas", list(CONF_NIVEIS.keys()),
+        help="Base = curva a termo. Cenários Alto/Baixo dimensionados pela "
+             "volatilidade implícita do petróleo (OVX) e histórica do gás.")
+    vol_manual_on = st.checkbox("Definir volatilidade manualmente (uso offline)", value=False)
+    vol_oleo_manual = st.number_input("Vol. do óleo (% a.a.)", value=35.0, min_value=1.0,
+                                      max_value=150.0, step=1.0,
+                                      disabled=not vol_manual_on) / 100.0
+    vol_gas_manual = st.number_input("Vol. do gás (% a.a.)", value=60.0, min_value=1.0,
+                                     max_value=200.0, step=1.0,
+                                     disabled=not vol_manual_on) / 100.0
 
     st.subheader("Gás natural")
     incluir_gas = st.checkbox("Incluir participação do gás", value=True)
@@ -912,7 +988,8 @@ params = dict(
     bacias=bacias, ambiente=ambiente, fator_rj=fator_rj, anos_sel=anos_sel,
     modo_preco=modo_preco, stat=stat, lookback=lookback, usar_tv=usar_tv,
     cambio_modo=cambio_modo, cambio_manual=cambio_manual, reajuste_oleo=reajuste_oleo,
-    conf_nivel=conf_nivel,
+    conf_nivel=conf_nivel, vol_manual_on=vol_manual_on,
+    vol_oleo_manual=vol_oleo_manual, vol_gas_manual=vol_gas_manual,
     incluir_gas=incluir_gas, col_gas=col_gas, gas_modo=gas_modo,
     gas_preco_manual=gas_preco_manual, reajuste_gas=reajuste_gas,
     aliquota=aliquota, cota_5=cota_5, cota_exc=cota_exc,
