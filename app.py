@@ -59,11 +59,15 @@ CONF_NIVEIS = {                       # rótulo -> quantil superior (z = inv_cdf
     "P25–P75 (50% de confiança)": 0.75,
 }
 DEFAULT_IMPLIED_VOL = 0.35            # fallback se o OVX não estiver disponível
-# Fração fixa da receita do RJ (Royalties + PE) aportada ao fundo por cenário
-PCT_APORTE_FUNDO = 0.10
+
+# Aporte ao fundo (LC 200/2022): 30% do INCREMENTO anual positivo da arrecadação
+# com Participação Especial + royalties excedentes (>5%). Não é % da receita cheia.
+APORTE_PCT_INCREMENTO = 0.30
+ANO_ANCORA_REALIZADO = 2025          # ano-base realizado p/ calibrar o nível projetado
 
 PROD_CSV = "previsao-producao.csv"
 HIST_CSV = "serie_historica_receitas_2015-2026.csv"
+REALIZADO_CSV = "receitas_petroleo_realizado.csv"   # realizado do Tesouro (RJ)
 
 st.set_page_config(
     page_title="Projeção RJ — Petróleo, Gás e Fundo Soberano",
@@ -106,6 +110,29 @@ def carregar_historico_pe_royalties(path: str = HIST_CSV):
     out = pd.DataFrame({"PE_liquida": pe, "Royalties_liquido": roy}).dropna()
     out = out[(out["PE_liquida"] > 0) & (out["Royalties_liquido"] > 0)]
     return out, True
+
+
+@st.cache_data(show_spinner=False)
+def carregar_realizado_tesouro(path: str = REALIZADO_CSV):
+    """
+    Receita realizada de royalties + Participação Especial do petróleo (líquida de
+    deduções), por ano, a partir do extrato do Tesouro/RJ. Usada como âncora de
+    nível (calibração) e para reconciliar a projeção com o realizado.
+    Obs.: o extrato agrega royalties e PE numa mesma sub-alínea (não separa PE
+    de excedente), então fornece o TOTAL realizado por ano. Retorna (Series, ok).
+    """
+    try:
+        r = pd.read_csv(path, sep=";", decimal=",", thousands=".", encoding="latin-1")
+    except Exception:
+        return None, False
+    r.columns = [c.strip() for c in r.columns]
+    r["ano"] = pd.to_datetime(r["Posição"], format="%d/%m/%Y", errors="coerce").dt.year
+    r["val"] = pd.to_numeric(r["Valor Receita Realizada"], errors="coerce").fillna(0.0)
+    nm = r["Nome Sub Alinea"].fillna("").str.lower()
+    oleo = nm.str.contains("royalt") | nm.str.contains("participa")   # exclui FEP
+    serie = r[oleo].groupby("ano")["val"].sum().dropna()              # deduções já negativas
+    serie = serie[serie > 0]
+    return serie, len(serie) > 0
 
 
 # --------------------------------------------------------------------------- #
@@ -494,11 +521,15 @@ def render_petroleo(df_prod, params):
         v_gas = (vol_gas_m3 * preco_gas_s).rename("valor_gas") if p["incluir_gas"] \
             else pd.Series(0.0, index=anos, name="valor_gas")
         v_prod = v_oleo.add(v_gas, fill_value=0)
-        r_rj = calcular_royalties(v_prod, aliquota, cota_5, cota_exc)["royalties_rj"]
+        rr = calcular_royalties(v_prod, aliquota, cota_5, cota_exc)
+        r_rj = rr["royalties_rj"]
+        r_exc = rr["rj_parcela_excedente"]     # royalties excedentes (>5%), cota RJ
         r_oleo = calcular_royalties(v_oleo, aliquota, cota_5, cota_exc)["royalties_rj"]
         pe = calc_pe(v_prod, r_rj)
+        # base LC 200/2022 = PE + royalties excedentes (>5%); exclui a parcela de 5%
         return {"valor_oleo": v_oleo, "valor_gas": v_gas, "valor_producao": v_prod,
-                "roy_rj": r_rj, "roy_oleo": r_oleo, "pe_rj": pe, "total": r_rj + pe}
+                "roy_rj": r_rj, "roy_oleo": r_oleo, "pe_rj": pe, "total": r_rj + pe,
+                "base_lc": pe + r_exc}
 
     # Base = curva a termo (z=0); Baixa/Alta escalam óleo e gás pela vol. implícita
     cenarios = {}
@@ -514,6 +545,19 @@ def render_petroleo(df_prod, params):
     pe_rj = base["pe_rj"]
     cenarios_tot = pd.DataFrame(
         {nome: cenarios[nome]["total"] for nome in ["Baixa", "Base", "Alta"]})
+    cenarios_base_lc = pd.DataFrame(
+        {nome: cenarios[nome]["base_lc"] for nome in ["Baixa", "Base", "Alta"]})
+
+    # Calibração ao realizado (âncora de nível): fator = realizado / projetado no
+    # ano-âncora. Corrige a superestimação de nível do modelo antes dos incrementos.
+    realizado_ser, real_ok = carregar_realizado_tesouro()
+    calib, real_ancora = 1.0, None
+    if real_ok and ANO_ANCORA_REALIZADO in realizado_ser.index \
+            and ANO_ANCORA_REALIZADO in cenarios_tot.index:
+        real_ancora = float(realizado_ser.loc[ANO_ANCORA_REALIZADO])
+        proj_ancora = float(cenarios_tot.loc[ANO_ANCORA_REALIZADO, "Base"])
+        if proj_ancora > 0:
+            calib = real_ancora / proj_ancora
 
     if p["metodo_pe"] == "Deduções informadas":
         pe_info = (f"PE por deduções: receita líquida = bruta × (1 − {p['ded_pct']:.0%}); "
@@ -563,6 +607,34 @@ def render_petroleo(df_prod, params):
                       margin=dict(l=10, r=10, t=50, b=10))
     st.plotly_chart(fig, width='stretch')
     st.dataframe(res.set_index("Ano"), width='stretch')
+
+    # ----- Reconciliação com o realizado (Tesouro) ------------------------- #
+    if real_ok:
+        st.divider()
+        st.subheader("🔎 Reconciliação com o realizado do Tesouro")
+        anos_rec = sorted(set(cenarios_tot.index) | set(realizado_ser.index))
+        rec = pd.DataFrame({
+            "Projetado Total (R$ bi)": (cenarios_tot["Base"].reindex(anos_rec) / 1e9),
+            "Realizado Tesouro (R$ bi)": (realizado_ser.reindex(anos_rec) / 1e9),
+        })
+        rec["Δ (proj − real)"] = rec["Projetado Total (R$ bi)"] - rec["Realizado Tesouro (R$ bi)"]
+        rec.index = [str(a) for a in rec.index]
+        rec.index.name = "Ano"
+        cc1, cc2 = st.columns([2, 1])
+        with cc2:
+            if real_ancora is not None:
+                st.metric(f"Realizado {ANO_ANCORA_REALIZADO} (âncora)", f"R$ {real_ancora/1e9:,.2f} bi")
+                st.metric("Projetado no ano-âncora",
+                          f"R$ {cenarios_tot.loc[ANO_ANCORA_REALIZADO,'Base']/1e9:,.2f} bi")
+                st.metric("Fator de calibração", f"{calib:,.3f}",
+                          delta=f"modelo superestima {((1/calib)-1)*100:,.0f}%" if calib < 1 else None,
+                          delta_color="off")
+        with cc1:
+            st.caption("O modelo é comparado ao realizado divulgado pelo Tesouro. O fator de "
+                       "calibração (realizado ÷ projetado no ano-âncora) alinha o nível antes "
+                       "de calcular os incrementos que alimentam o fundo. O extrato agrega "
+                       "royalties + PE numa mesma rubrica, então serve como âncora de nível.")
+            st.dataframe(rec.round(2), width='stretch')
 
     # ----- Comparação de cenários (sem fan chart) -------------------------- #
     st.divider()
@@ -637,8 +709,9 @@ e **{cota_exc:.1%}** da excedente. Alíquota: {aliquota:.1%}.
 Regras pela liminar do STF de 2013; se a Lei 12.734/12 for validada, ajuste as cotas.*
 """)
 
-    # Total do RJ (Royalties + PE) por cenário, em R$, para alimentar o fundo
-    return cenarios_tot
+    # Dados por cenário para alimentar o fundo (aporte = 30% do incremento da base LC)
+    return {"total": cenarios_tot, "base_lc": cenarios_base_lc,
+            "calib": calib, "real_ok": real_ok, "ano_ancora": ANO_ANCORA_REALIZADO}
 
 
 # --------------------------------------------------------------------------- #
@@ -649,8 +722,9 @@ def render_fundo(cenarios_receita=None):
     st.caption(
         "Premissa: todo o patrimônio está aplicado em títulos públicos de curto a médio "
         "prazo (horizonte máximo de 4 anos), remunerados pela taxa Selic. Parte dos "
-        f"rendimentos é sacada a cada ano; o fundo recebe aporte fixo de "
-        f"**{PCT_APORTE_FUNDO:.0%}** da receita de petróleo/gás do RJ em cada cenário."
+        "rendimentos é sacada a cada ano; o aporte segue a **LC 200/2022** — "
+        f"**{APORTE_PCT_INCREMENTO:.0%} do incremento anual** da arrecadação com "
+        "Participação Especial + royalties excedentes (não um % da receita cheia)."
     )
 
     cfg1, cfg2 = st.columns([1, 1])
@@ -676,15 +750,23 @@ def render_fundo(cenarios_receita=None):
             f"Ano {i+1} ({ano0 + i})", value=defaults[i],
             min_value=0.0, max_value=50.0, step=0.25, key=f"selic_{i}") / 100.0)
 
-    # ----- Aportes por cenário (percentual fixo da receita) ---------------- #
-    tem_cenarios = cenarios_receita is not None and not cenarios_receita.empty
+    # ----- Aportes por cenário (LC 200/2022: 30% do incremento anual) ------ #
+    tem_cenarios = (cenarios_receita is not None
+                    and isinstance(cenarios_receita, dict)
+                    and not cenarios_receita["base_lc"].empty)
     fund_years = [ano0 + i for i in range(len(taxas))]
+    calib = cenarios_receita["calib"] if tem_cenarios else 1.0
+    base_lc_df = cenarios_receita["base_lc"] if tem_cenarios else None
 
     def aportes_do_cenario(scn):
-        if not (tem_cenarios and scn in cenarios_receita):
+        """Aporte_t = 30% × max(base_t − base_{t-1}, 0), base = PE + excedente
+        calibrada ao realizado. O ano anterior ao 1º ano do fundo ancora o incremento."""
+        if not (tem_cenarios and scn in base_lc_df):
             return [0.0] * len(taxas)
-        serie = cenarios_receita[scn].reindex(fund_years).fillna(0.0)
-        return list(serie.values * PCT_APORTE_FUNDO)
+        serie = base_lc_df[scn].sort_index() * calib      # base calibrada, série completa
+        incremento = serie.diff()                          # preserva o ano-âncora anterior
+        aporte = (APORTE_PCT_INCREMENTO * incremento.clip(lower=0))
+        return list(aporte.reindex(fund_years).fillna(0.0).values)
 
     dff_scn = {}
     for scn in ["Baixa", "Base", "Alta"]:
@@ -694,6 +776,10 @@ def render_fundo(cenarios_receita=None):
     if not tem_cenarios:
         st.info("ℹ️ Selecione bacias/anos na aba **Petróleo e Gás** para projetar os três "
                 "cenários de receita no fundo. Exibindo apenas a dinâmica base (sem aportes).")
+    elif calib != 1.0:
+        st.caption(f"Base de incremento calibrada ao realizado {cenarios_receita['ano_ancora']} "
+                   f"(fator {calib:,.3f}). Aporte = {APORTE_PCT_INCREMENTO:.0%} do incremento "
+                   "anual positivo de (PE + royalties excedentes).")
 
     # ----- Métricas -------------------------------------------------------- #
     patr_final = dff["patr_fim"].iloc[-1]
@@ -817,7 +903,9 @@ públicos de curto a médio prazo (horizonte ≤ 4 anos), remunerados pela **Sel
 - Rendimento bruto = patrimônio no início do ano × Selic esperada do ano
 - Saque = rendimento bruto × {pct_saque:.0%} (revertido a outros fins)
 - Reinvestido = rendimento bruto − saque
-- Aporte = **{PCT_APORTE_FUNDO:.0%}** da receita de petróleo/gás do RJ no cenário (fixo)
+- Aporte (**LC 200/2022**) = **{APORTE_PCT_INCREMENTO:.0%} do incremento anual positivo**
+  da arrecadação com Participação Especial + royalties excedentes (>5%), por cenário —
+  **não** um percentual da receita cheia. A base é calibrada ao realizado do Tesouro.
 - Patrimônio ao fim = patrimônio no início + reinvestido + aporte
 
 O **primeiro gráfico** não usa valores em R$: apresenta o nível/sinal e a inclinação da
@@ -825,7 +913,8 @@ curva de rendimentos (Selic anual e índice acumulado base 100). O **segundo gr�
 mostra a capitalização do fundo nos três cenários (Baixa/Base/Alta), com os fluxos
 anuais do cenário base nas barras.
 
-*Modelo simplificado: não considera marcação a mercado, tributação ou inflação.
+*Aportes pontuais de TAC e leilões (50%, LC 200/2022) não estão projetados.
+Modelo simplificado: não considera marcação a mercado, tributação ou inflação.
 Os cenários de receita vêm da aba Petróleo e Gás (bandas por volatilidade implícita).*
 """)
 
