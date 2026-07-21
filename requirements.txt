@@ -4,4 +4,8 @@ numpy>=1.24
 plotly>=5.18
 yfinance>=0.2.40
 openpyxl>=3.1
-tvdatafeed>=2.1.0
+
+# Opcional — fallback de curva a termo via TradingView (BRN1!).
+# NÃO está no PyPI: instale manualmente, fora do deploy, se quiser habilitar:
+#   pip install --upgrade git+https://github.com/rongardF/tvdatafeed.git
+# O app.py importa tvDatafeed com try/except; sem ele, usa Yahoo/manual.
